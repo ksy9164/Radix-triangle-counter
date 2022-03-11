@@ -10,11 +10,14 @@ import DRAMController::*;
 import Serializer::*;
 import FIFOLI::*;
 
+import BLRadix::*;
 interface HwMainIfc;
 endinterface
 
 module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram) 
     (HwMainIfc);
+	BLRadixIfc#(8,3,4,Bit#(32),0,7) radixSub <- mkBLRadix;
+
     Reg#(Bit#(32)) file_size <- mkReg(0);
     Reg#(Bit#(32)) dramWriteCnt <- mkReg(0);
     Reg#(Bit#(32)) dramReadCnt <- mkReg(0);
@@ -22,12 +25,13 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
 
     SerializerIfc#(128, 4) serial_pcieio <- mkSerializer;
     SerializerIfc#(128, 16) serial_input <- mkSerializer;
-    DeSerializerIfc#(8, 64) deserial_dram <- mkDeSerializer;
+    DeSerializerIfc#(128, 4) deserial_dram <- mkDeSerializer;
     SerializerIfc#(512, 4) serial_dramQ <- mkSerializer;
 
     FIFO#(Bit#(32)) dmaReadReqQ <- mkFIFO;
     FIFO#(Bit#(32)) dmaWriteReqQ <- mkFIFO;
     FIFO#(Bit#(1)) dmaWriteDoneSignalQ <- mkFIFO;
+    FIFO#(Bit#(128)) dma_inQ <- mkFIFO;
 
     Reg#(Bit#(32)) readCnt <- mkReg(0);
 
@@ -64,18 +68,64 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         readCnt <= cnt;
     endrule
 
+
     rule getDataFromDMA(readCnt != 0);
         Bit#(128) rd <- pcie.dmaReadWord;
         if (readCnt - 1 == 0) begin
             dmaWriteDoneSignalQ.enq(1);
         end
         readCnt <= readCnt - 1;
-        serial_input.put(rd);
+        dma_inQ.enq(rd);
     endrule
 
-    rule mergingForDRAM;
-        Bit#(8) d <- serial_input.get;
-        deserial_dram.put(d);
+	Reg#(Bit#(32)) dataInputCounter <- mkReg(0);
+	FIFO#(Vector#(4, Bit#(32))) toUploader <- mkFIFO;
+
+	Integer dataCnt = 1024*512;
+
+	rule inputData;
+	    dma_inQ.deq;
+        Bit#(128) t = dma_inQ.first;
+		dataInputCounter <= dataInputCounter + 1;
+		Vector#(4,Bit#(32)) ind;
+		ind[0] = t[127:96];
+		ind[1] = t[95:64];
+		ind[2] = t[63:32];
+		ind[3] = t[31:0];
+		radixSub.enq(ind);
+	endrule
+
+	Reg#(Bit#(32)) burstTotal <- mkReg(0);
+	Reg#(Bit#(32)) startCycle <- mkReg(0);
+	rule flushBurstReady;
+		let d <- radixSub.burstReady;
+		burstTotal <= burstTotal + zeroExtend(d);
+	endrule
+
+	Reg#(Bit#(32)) dataOutputCounter <- mkReg(0);
+	rule readOutput;
+		Vector#(4,Bit#(32)) outd = radixSub.first;
+		radixSub.deq;
+		toUploader.enq(outd);
+		dataOutputCounter <= dataOutputCounter + 1;
+	endrule
+
+
+    Vector#(4, FIFO#(Bit#(32))) toNodeQ <- replicateM(mkFIFO);
+    Reg#(Bit#(32)) run_cnt <- mkReg(0); 
+    Reg#(Bit#(32)) clock_cnt <- mkReg(0); 
+
+    rule get_Data_from_radix_sorter;
+        toUploader.deq;
+        Vector#(4, Bit#(32)) t = toUploader.first;
+        Bit#(128) d = 0;
+        
+		d[127:96] = t[0];
+		d[95:64] = t[1]; 
+		d[63:32] = t[2]; 
+		d[31:0] = t[3]; 
+
+		deserial_dram.put(d);
     endrule
 
     /* Write to DRAM */
